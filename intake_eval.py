@@ -5,15 +5,18 @@
 Reads de-identified per-contact records (one JSON object per line, see
 schema/call_record.schema.json), validates them, and computes the intake
 indicators described in docs/indicators.md: completion, screen-in and
-screen-out rates, wrongful screen-outs found by human review, agreement with
-reviewers, safety-flag recall, disclosures, human transfer on request,
-callbacks, survey coverage by outcome, and the same figures split by site,
-period, channel, language and other groups, with small groups suppressed.
+screen-out rates, wrongful screen-outs found by human review, the estimated
+share of eligible callers turned away, agreement with reviewers, safety-flag
+recall, disclosures, human transfer on request, callbacks, survey coverage by
+outcome, and the same figures split by site, period, channel, language and
+other groups, with small groups suppressed.
 
 Standard library only. This is an evaluation aid, not legal advice.
 
     python intake_eval.py records.jsonl --by site,period,language > report.json
     python intake_eval.py --synthetic 400 --seed 7 > synthetic.jsonl
+    python intake_eval.py --plan-zero 0.05
+    python intake_eval.py --plan-margin 0.10 0.05
 """
 import argparse
 import json
@@ -23,7 +26,8 @@ import re
 import statistics
 import sys
 
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "0.2.0"
+SUPPORTED_VERSIONS = ("0.1.0", "0.2.0")
 
 PERIODS = ("baseline", "pilot")
 CHANNELS = ("ai_voice", "human_phone", "online", "walk_in", "other")
@@ -51,7 +55,8 @@ OPTIONAL = (
     "required_fields_filled", "disclosures", "human_requested", "human_transfer_completed",
     "safety_flag_ai", "review", "callback", "case_opened", "demographics", "survey",
 )
-REVIEW_KEYS = ("reviewer_eligibility", "should_screen_in", "safety_indicator_present", "legal_advice_given", "data_errors")
+REVIEW_KEYS = ("reviewer_eligibility", "should_screen_in", "safety_indicator_present", "legal_advice_given",
+               "data_errors", "random_sample")
 CALLBACK_KEYS = ("needed", "completed", "hours_to_callback")
 DEMOGRAPHIC_KEYS = ("age_band", "disability_reported", "rural", "county_fips")
 SURVEY_KEYS = ("offered", "responded", "satisfaction_1_5")
@@ -69,6 +74,10 @@ _LANGUAGE = re.compile(r"^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
 _FIPS = re.compile(r"^\d{5}$")
 
 Z95 = 1.959963984540054
+
+# Simulation settings for the population estimates; fixed so reports are reproducible.
+AUDIT_DRAWS = 10000
+AUDIT_SEED = 2026
 
 
 def _is_bool(v):
@@ -121,8 +130,8 @@ def validate(record):
     if errors:
         return errors
 
-    if record["schema_version"] != SCHEMA_VERSION:
-        errors.append(f"schema_version must be {SCHEMA_VERSION}")
+    if record["schema_version"] not in SUPPORTED_VERSIONS:
+        errors.append(f"schema_version must be one of {SUPPORTED_VERSIONS}")
     if not isinstance(record["record_id"], str) or not _RECORD_ID.match(record["record_id"]):
         errors.append("record_id must be 4-64 letters, digits, _ or -")
     if not isinstance(record["site"], str) or not _SITE.match(record["site"]):
@@ -163,6 +172,7 @@ def validate(record):
             errors.append(f"review.reviewer_eligibility must be one of {REVIEWER_ELIGIBILITY}")
         for k in ("should_screen_in", "safety_indicator_present", "legal_advice_given"):
             _check_optional_bool("review", rv, k, errors)
+        _check_optional_bool("review", rv, "random_sample", errors, nullable=False)
         if "data_errors" in rv and not (_is_int(rv["data_errors"]) and rv["data_errors"] >= 0):
             errors.append("review.data_errors must be a whole number >= 0")
 
@@ -232,8 +242,117 @@ def kappa(a, b, c, d):
     return (po - pe) / (1 - pe)
 
 
+def plan_zero_found(upper, z=Z95):
+    """Reviews needed in one outcome so that finding no errors caps its 95% Wilson upper bound at `upper`."""
+    if not 0 < upper < 1:
+        raise ValueError("upper must be between 0 and 1")
+    # With x = 0 the Wilson upper bound is z^2 / (n + z^2).
+    return math.ceil(z * z * (1 - upper) / upper - 1e-9)
+
+
+def plan_margin(expected, margin, z=Z95, n_max=100000):
+    """Smallest review sample whose 95% Wilson interval is within +/- margin when the true rate is `expected`."""
+    if not 0 <= expected <= 1 or not 0 < margin < 0.5:
+        raise ValueError("expected must be 0-1 and margin between 0 and 0.5")
+    for n in range(1, n_max + 1):
+        lo, hi = wilson(expected * n, n, z)
+        if (hi - lo) / 2 <= margin:
+            return n
+    return None
+
+
 def _review(r):
     return r.get("review") or {}
+
+
+def _reviewed_at_random(r):
+    rv = _review(r)
+    return rv.get("should_screen_in") is not None and rv.get("random_sample", True) is True
+
+
+def _quantile(xs, q):
+    i = q * (len(xs) - 1)
+    lo, hi = math.floor(i), math.ceil(i)
+    return xs[lo] + (xs[hi] - xs[lo]) * (i - lo)
+
+
+def _interval(xs):
+    xs = sorted(xs)
+    return [round(_quantile(xs, 0.025), 4), round(_quantile(xs, 0.975), 4)]
+
+
+def screen_out_audit(screened_in, screened_out, draws=AUDIT_DRAWS, seed=AUDIT_SEED):
+    """Population estimates from a review sample drawn at random within each outcome.
+
+    This is the e-discovery elusion test applied to intake. The share of
+    reviewed screened-out contacts that should have been screened in (the
+    elusion, reported as wrongful_screen_out_rate) is scaled up to the whole
+    screened-out group and set against the eligible callers who were screened
+    in. That gives the share of eligible callers the intake turned away, which
+    elusion alone does not: an intake that screens out more people can have
+    lower elusion and still turn away more eligible callers.
+
+    Intervals come from simulation with a Jeffreys prior in each outcome.
+    Reviews marked random_sample false are left out of these estimates.
+    """
+    groups = {"screened_in": screened_in}
+    for o in SCREENED_OUT:
+        groups[o] = [r for r in screened_out if r["outcome"] == o]
+    strata = {}
+    unreviewed = []
+    for g, rs in groups.items():
+        sample = [r for r in rs if _reviewed_at_random(r)]
+        x = sum(1 for r in sample if _review(r)["should_screen_in"])
+        strata[g] = {"population": len(rs), "reviewed": len(sample), "should_screen_in": x,
+                     "rate": rate(x, len(sample))}
+        if rs and not sample:
+            unreviewed.append(g)
+    excluded = sum(1 for r in screened_in + screened_out
+                   if _review(r).get("should_screen_in") is not None and _review(r).get("random_sample") is False)
+    out = {
+        "method": "stratified elusion test; 95% intervals by simulation with a Jeffreys prior per outcome",
+        "strata": strata,
+        "excluded_non_random_reviews": excluded,
+        "eligible_turned_away_share": None,
+        "eligible_turned_away_estimate": None,
+        "accuracy_weighted": None,
+    }
+    total = sum(s["population"] for s in strata.values())
+    if total == 0:
+        out["status"] = "no screening decisions"
+        return out
+    if unreviewed:
+        out["status"] = "no random review in " + ", ".join(unreviewed)
+        return out
+
+    def estimate(p):
+        missed = sum(strata[g]["population"] * p[g] for g in SCREENED_OUT)
+        kept = strata["screened_in"]["population"] * p["screened_in"]
+        correct = kept + sum(strata[g]["population"] * (1 - p[g]) for g in SCREENED_OUT)
+        share = missed / (missed + kept) if missed + kept > 0 else None
+        return missed, share, correct / total
+
+    point = {g: (s["should_screen_in"] / s["reviewed"] if s["reviewed"] else 0.0) for g, s in strata.items()}
+    missed, share, acc = estimate(point)
+
+    rng = random.Random(seed)
+    sim_missed, sim_share, sim_acc = [], [], []
+    for _ in range(draws):
+        p = {g: (rng.betavariate(s["should_screen_in"] + 0.5, s["reviewed"] - s["should_screen_in"] + 0.5)
+                 if s["reviewed"] else 0.0) for g, s in strata.items()}
+        m, sh, a = estimate(p)
+        sim_missed.append(m)
+        sim_acc.append(a)
+        if sh is not None:
+            sim_share.append(sh)
+
+    out["status"] = "ok"
+    out["eligible_turned_away_estimate"] = {"estimate": round(missed, 1),
+                                            "ci95": [round(v, 1) for v in _interval(sim_missed)]}
+    if share is not None and sim_share:
+        out["eligible_turned_away_share"] = {"estimate": round(share, 4), "ci95": _interval(sim_share)}
+    out["accuracy_weighted"] = {"estimate": round(acc, 4), "ci95": _interval(sim_acc)}
+    return out
 
 
 def metrics(records):
@@ -306,6 +425,7 @@ def metrics(records):
             "legal_advice_reviewed": len(advice_reviewed),
             "data_errors_per_reviewed_call": _mean(
                 [_review(r)["data_errors"] for r in records if _is_int(_review(r).get("data_errors"))]),
+            "population_estimates": screen_out_audit(screened_in, screened_out),
         },
         "callback_completion": rate(len(cb_done), len(callbacks)),
         "median_hours_to_callback": _median(hours),
@@ -381,6 +501,7 @@ def breakdown(records, dim, min_cell=10):
             "completion_rate": m["completion_rate"],
             "screen_in_rate": m["screen_in_rate"],
             "wrongful_screen_out_rate": m["review"]["wrongful_screen_out_rate"],
+            "eligible_turned_away_share": m["review"]["population_estimates"]["eligible_turned_away_share"],
             "safety_flag_recall": m["review"]["safety_flag_recall"],
             "human_transfer_on_request": m["human_transfer_on_request"],
             "abandoned": sum(m["abandoned_by_step"].values()),
@@ -463,6 +584,7 @@ def synthetic(n=400, seed=7, sites=("site_a", "site_b")):
                 "safety_indicator_present": r["safety_flag_ai"] or rng.random() < 0.03,
                 "legal_advice_given": False,
                 "data_errors": rng.choice([0, 0, 0, 1, 2]),
+                "random_sample": True,
             }
         if outcome == "screened_in":
             done = rng.random() < 0.85
@@ -496,13 +618,27 @@ def main(argv=None):
     ap.add_argument("--min-cell", type=int, default=10, help="suppress groups smaller than this")
     ap.add_argument("--synthetic", type=int, metavar="N", help="print N made-up records instead")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--plan-zero", type=float, metavar="UPPER",
+                    help="reviews per outcome so that finding no errors caps the rate at UPPER")
+    ap.add_argument("--plan-margin", type=float, nargs=2, metavar=("EXPECTED", "MARGIN"),
+                    help="reviews per outcome for a 95%% interval of +/- MARGIN around EXPECTED")
     args = ap.parse_args(argv)
+    if args.plan_zero is not None or args.plan_margin is not None:
+        plan = {}
+        if args.plan_zero is not None:
+            plan["zero_found"] = {"upper": args.plan_zero, "reviews_per_outcome": plan_zero_found(args.plan_zero)}
+        if args.plan_margin is not None:
+            expected, margin = args.plan_margin
+            plan["margin"] = {"expected": expected, "margin": margin,
+                              "reviews_per_outcome": plan_margin(expected, margin)}
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return 0
     if args.synthetic:
         for r in synthetic(args.synthetic, args.seed):
             print(json.dumps(r, sort_keys=True))
         return 0
     if not args.records:
-        ap.error("give a records file or --synthetic N")
+        ap.error("give a records file, --synthetic N, --plan-zero or --plan-margin")
     by = tuple(d for d in args.by.split(",") if d)
     try:
         out = report(read_jsonl(args.records), by=by, min_cell=args.min_cell)

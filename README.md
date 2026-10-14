@@ -10,26 +10,55 @@ Legal aid programs are now piloting AI voice agents that answer the intake line,
 
 What none of them gives is a **de-identified, per-contact record that two programs can fill in the same way**, plus code that turns it into comparable numbers. This repository is a first draft of that.
 
+## New in 0.2.0: how many eligible callers were turned away
+
+An eligible caller who is wrongly screened out leaves no case behind, so the error is invisible unless someone looks. Version 0.1.0 reported the **wrongful screen-out rate**: of the screened-out calls a reviewer read, the share that should have been screened in. E-discovery calls this the *elusion* rate, and its known weakness carries over: **elusion alone cannot compare two intakes.** An intake that turns away more people can show lower elusion and still miss more eligible callers.
+
+A worked example (made-up numbers, reproduced in the tests). Each period has 1,000 screening decisions, and a reviewer reads 30 random calls from each outcome:
+
+| | Screened in | Screened out | Errors found in 30 screened in | Errors found in 30 screened out (elusion) | Est. eligible callers turned away | Share of eligible callers turned away |
+|---|---|---|---|---|---|---|
+| Baseline | 800 | 200 | 1 | 3 (10.0%) | 20 | **2.5%** |
+| Pilot | 500 | 500 | 1 | 2 (6.7%) | 33 | **6.5%** |
+
+On elusion the pilot looks better. In fact it turns away about 2.6 times the share of eligible callers.
+
+Version 0.2.0 adds the missing step, borrowed from stratified recall estimation in e-discovery review. Every contact is a record, so the size of each outcome group is known. The reviewed sample in each group is scaled up to the whole group, which gives:
+
+- **eligible callers turned away**: an estimated count, and as a share of all eligible callers, the figure a program and its funder actually care about;
+- **weighted accuracy**: agreement with reviewers across all decisions, weighted by group size rather than by how many calls happened to be reviewed;
+- 95% intervals by simulation (a Jeffreys prior in each outcome group, fixed seed, so reports are reproducible). Finding no errors still gives an honest upper bound.
+
+It also adds `review.random_sample`. Reviews prompted by a complaint or a flag are useful, but they are not a random sample, so they are kept out of these estimates and counted separately. Also new is a **review-size planner**:
+
+```
+python intake_eval.py --plan-zero 0.05        # 73 reviews per outcome: finding none caps the rate at 5%
+python intake_eval.py --plan-margin 0.10 0.05 # reviews for +/- 5 points around an expected 10%
+```
+
+Prior work: elusion and stratified recall sampling are standard in e-discovery validation. Practitioners warn that a sample from the discard pile alone overstates recall, and recommend sampling every group, as in *In re Broiler Chicken* (Douglas Forrest, ["The Elusion Illusion and the AI Revolution"](https://aceds.org/the-elusion-illusion-and-the-ai-revolution-aceds-blog/), ACEDS, 25 June 2026). We found no legal aid intake evaluation, pilot report or draft standard that estimates the share of eligible callers turned away from a stratified review sample. This version applies known statistics to a new setting. It is not a new statistical method.
+
 ## What is here
 
 | Path | What it is |
 |---|---|
-| `schema/call_record.schema.json` | JSON Schema (2020-12) for one intake contact: site, baseline or pilot period, channel, language, consent, outcome, where callers dropped off, disclosures delivered, human transfer on request, safety flag, a human-review block, callback, case opened, banded demographics and survey offer/response. No names, phone numbers, addresses, birth dates, transcripts or free text, by design. |
-| `intake_eval.py` | Validator and metrics, standard library only. |
+| `schema/call_record.schema.json` | JSON Schema (2020-12) for one intake contact: site, baseline or pilot period, channel, language, consent, outcome, where callers dropped off, disclosures delivered, human transfer on request, safety flag, a human-review block, callback, case opened, banded demographics and survey offer/response. No names, phone numbers, addresses, birth dates, transcripts or free text, by design. Version 0.1.0 records stay valid. |
+| `intake_eval.py` | Validator, metrics and review-size planner, standard library only. |
 | `docs/indicators.md` | Each indicator: definition, which data it comes from, and how it maps to LSC TIG evaluation plans (goals, objectives; administrative, survey and qualitative data). |
-| `test_intake_eval.py` | Tests, including that the schema file and the code agree. |
+| `test_intake_eval.py` | Tests, including that the schema file and the code agree, and the worked example above. |
 
 ## Indicators computed
 
 For the whole file and for each site, period, channel, language or demographic group (groups under `--min-cell`, default 10, are suppressed):
 
 - **Funnel**: consent rate, completion rate (completed ÷ consented), abandonment by step, screen-in rate, referral rate when screened out, required-field completeness, median duration, after-hours share.
-- **Human review sample**: wrongful screen-out rate (screened out, reviewer says should have been screened in), wrongful screen-in rate, agreement and Cohen's kappa with reviewers, safety-flag recall, reviewer-found legal-advice incidents, data errors per reviewed call.
+- **Human review sample**: wrongful screen-out rate (elusion), wrongful screen-in rate, agreement and Cohen's kappa within the reviewed sample, safety-flag recall, reviewer-found legal-advice incidents, data errors per reviewed call.
+- **Population estimates** (0.2.0): eligible callers turned away (count and share of all eligible callers) and weighted accuracy, with 95% intervals.
 - **AI conduct**: share of contacts where each disclosure was delivered (AI self-identification, not-a-lawyer, consent captured, follow-up timeline); human transfer completed when asked.
 - **Downstream**: callback completion, median hours to callback, cases opened when screened in.
 - **Survey coverage by outcome**: who was *offered* feedback, split by screened in, screened out and other, with a flag when screened-out callers were offered it at under half the rate of screened-in callers. Satisfaction gathered only from people who got help says nothing about people who were turned away.
 
-Every proportion comes with its count, denominator and a 95% Wilson interval, because pilot samples are small.
+Every proportion comes with its count, denominator and a 95% interval, because pilot samples are small.
 
 ## Use
 
@@ -45,9 +74,11 @@ The validator rejects any field outside the schema and any value shaped like an 
 
 ## Limits
 
-- Version 0.1.0 is a draft, not yet used on a live program. Field names will change once it meets real LegalServer exports and real evaluation plans.
+- Version 0.2.0 is a draft, not yet used on a live program. Field names will change once it meets real LegalServer exports and real evaluation plans.
 - It measures intake, not legal outcomes. Whether a screened-in case was helped needs case-closing data that differs by program.
-- The human-review numbers are only as good as the sample. Draw it at random, within each outcome, and include screened-out callers.
+- The population estimates are only as good as the sample. Draw it at random within each outcome, include screened-out callers, and mark anything else `random_sample: false`. Reviews where the reviewer could not decide (`should_screen_in` null) are left out. If those calls differ from the rest, the estimate is biased, so report how many there were.
+- The intervals ignore the finite-population correction, which makes them slightly wide when a large part of a group is reviewed.
+- Callers who hang up before a decision are not in the screened-out group. Abandonment by step is reported separately and is not counted as "turned away".
 - Thresholds are left to each program and its funder. Where the Legal Help Commons draft standard sets them, use that document; this repository does not restate it.
 - Contact data about people seeking legal help is sensitive. Run this where the program's own data rules allow. It needs no network and sends nothing anywhere.
 

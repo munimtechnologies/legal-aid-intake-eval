@@ -33,6 +33,31 @@ def review(should_in, safety=False):
             "legal_advice_given": False, "data_errors": 0}
 
 
+def stratum(start, outcome, population, reviewed, should_in, **kw):
+    """`population` records with one outcome; the first `reviewed` are a random review sample."""
+    rs = []
+    for j in range(population):
+        r = rec(start + j, outcome=outcome, **kw)
+        if j < reviewed:
+            r["review"] = dict(review(j < should_in), random_sample=True)
+        rs.append(r)
+    return rs
+
+
+def paradox_records():
+    """The worked example in docs/indicators.md.
+
+    Baseline: 800 screened in, 200 screened out; 30 reviewed in each, 1 and 3 errors.
+    Pilot:    500 screened in, 500 screened out; 30 reviewed in each, 1 and 2 errors.
+    """
+    rs = []
+    rs += stratum(0, "screened_in", 800, 30, 29, period="baseline", channel="human_phone")
+    rs += stratum(1000, "screened_out_no_referral", 200, 30, 3, period="baseline", channel="human_phone")
+    rs += stratum(2000, "screened_in", 500, 30, 29)
+    rs += stratum(3000, "screened_out_no_referral", 500, 30, 2)
+    return rs
+
+
 class TestStatistics(unittest.TestCase):
     def test_wilson_zero_of_ten(self):
         lo, hi = ie.wilson(0, 10)
@@ -55,9 +80,36 @@ class TestStatistics(unittest.TestCase):
         self.assertIsNone(ie.kappa(0, 0, 0, 0))
 
 
+class TestPlanning(unittest.TestCase):
+    def test_zero_found(self):
+        self.assertEqual(ie.plan_zero_found(0.05), 73)
+        self.assertEqual(ie.plan_zero_found(0.10), 35)
+        for upper in (0.02, 0.05, 0.1, 0.2):
+            n = ie.plan_zero_found(upper)
+            self.assertLessEqual(ie.wilson(0, n)[1], upper)
+            self.assertGreater(ie.wilson(0, n - 1)[1], upper)
+        with self.assertRaises(ValueError):
+            ie.plan_zero_found(0)
+
+    def test_margin(self):
+        def half(p, n):
+            lo, hi = ie.wilson(p * n, n)
+            return (hi - lo) / 2
+        n = ie.plan_margin(0.10, 0.05)
+        self.assertTrue(130 <= n <= 150, n)
+        self.assertLessEqual(half(0.10, n), 0.05)
+        self.assertGreater(half(0.10, n - 1), 0.05)
+        self.assertGreater(ie.plan_margin(0.5, 0.05), n)
+        with self.assertRaises(ValueError):
+            ie.plan_margin(0.1, 0)
+
+
 class TestValidate(unittest.TestCase):
     def test_minimal_record_is_valid(self):
         self.assertEqual(ie.validate(rec(1)), [])
+
+    def test_earlier_schema_version_accepted(self):
+        self.assertEqual(ie.validate(rec(1, schema_version="0.1.0")), [])
 
     def test_identifier_fields_rejected(self):
         for key in ("name", "phone", "address", "transcript", "notes", "dob", "email"):
@@ -69,7 +121,8 @@ class TestValidate(unittest.TestCase):
                    required_fields_total=20, required_fields_filled=18,
                    disclosures={"ai_identified": True, "not_a_lawyer": True},
                    human_requested=True, human_transfer_completed=None, safety_flag_ai=False,
-                   review=review(True), callback={"needed": True, "completed": None, "hours_to_callback": None},
+                   review=dict(review(True), random_sample=True),
+                   callback={"needed": True, "completed": None, "hours_to_callback": None},
                    case_opened=None, demographics={"age_band": "25_44", "rural": True, "county_fips": "47037"},
                    survey={"offered": True, "responded": True, "satisfaction_1_5": 4})
         self.assertEqual(ie.validate(full), [])
@@ -88,6 +141,7 @@ class TestValidate(unittest.TestCase):
         self.assertTrue(ie.validate(rec(1, survey={"offered": True, "responded": True, "satisfaction_1_5": 6})))
         self.assertTrue(ie.validate(rec(1, demographics={"county_fips": "4703"})))
         self.assertTrue(ie.validate(rec(1, review={"should_screen_in": "yes"})))
+        self.assertTrue(ie.validate(rec(1, review={"should_screen_in": True, "random_sample": None})))
         self.assertTrue(ie.validate(rec(1, schema_version="0.0.1")))
 
     def test_report_rejects_duplicates_and_invalid(self):
@@ -138,6 +192,14 @@ class TestMetrics(unittest.TestCase):
         # a=5, b=1, c=1, d=3
         self.assertAlmostEqual(rv["kappa"], ie.kappa(5, 1, 1, 3), places=4)
 
+    def test_every_contact_reviewed_gives_exact_share(self):
+        # Every decision reviewed: 5 eligible screened in, 1 eligible screened out (of 2 + 2).
+        est = self.m["review"]["population_estimates"]
+        self.assertEqual(est["status"], "ok")
+        self.assertAlmostEqual(est["eligible_turned_away_share"]["estimate"], 1 / 6, places=4)
+        self.assertAlmostEqual(est["eligible_turned_away_estimate"]["estimate"], 1.0, places=1)
+        self.assertAlmostEqual(est["accuracy_weighted"]["estimate"], 0.8, places=4)
+
     def test_safety_and_transfer(self):
         rs = [
             rec(1, safety_flag_ai=True, review=review(True, safety=True)),
@@ -185,6 +247,71 @@ class TestMetrics(unittest.TestCase):
         self.assertFalse(ie.survey_coverage(rs2)["screened_out_under_surveyed"])
 
 
+class TestScreenOutAudit(unittest.TestCase):
+    def setUp(self):
+        self.rs = paradox_records()
+        self.base = [r for r in self.rs if r["period"] == "baseline"]
+        self.pilot = [r for r in self.rs if r["period"] == "pilot"]
+
+    def test_lower_elusion_can_hide_more_people_turned_away(self):
+        mb = ie.metrics(self.base)["review"]
+        mp = ie.metrics(self.pilot)["review"]
+        # Elusion: the pilot looks better (2 of 30 against 3 of 30) ...
+        self.assertAlmostEqual(mb["wrongful_screen_out_rate"]["rate"], 0.1, places=4)
+        self.assertAlmostEqual(mp["wrongful_screen_out_rate"]["rate"], 0.0667, places=4)
+        # ... but it turns away 2.6 times the share of eligible callers.
+        sb = mb["population_estimates"]["eligible_turned_away_share"]
+        sp = mp["population_estimates"]["eligible_turned_away_share"]
+        self.assertAlmostEqual(sb["estimate"], 20 / (20 + 800 * 29 / 30), places=4)
+        self.assertAlmostEqual(sp["estimate"], (500 * 2 / 30) / (500 * 2 / 30 + 500 * 29 / 30), places=4)
+        self.assertAlmostEqual(sb["estimate"], 0.0252, places=4)
+        self.assertAlmostEqual(sp["estimate"], 0.0645, places=4)
+        self.assertAlmostEqual(mb["population_estimates"]["eligible_turned_away_estimate"]["estimate"], 20.0)
+        self.assertAlmostEqual(mp["population_estimates"]["eligible_turned_away_estimate"]["estimate"], 33.3)
+        self.assertAlmostEqual(mb["population_estimates"]["accuracy_weighted"]["estimate"], 0.9533, places=4)
+        self.assertAlmostEqual(mp["population_estimates"]["accuracy_weighted"]["estimate"], 0.95, places=4)
+
+    def test_intervals(self):
+        est = ie.metrics(self.base)["review"]["population_estimates"]
+        for key in ("eligible_turned_away_share", "accuracy_weighted"):
+            lo, hi = est[key]["ci95"]
+            self.assertTrue(0 <= lo <= est[key]["estimate"] <= hi <= 1, (key, est[key]))
+        lo, hi = est["eligible_turned_away_estimate"]["ci95"]
+        self.assertTrue(0 <= lo <= 20 <= hi <= 200, (lo, hi))
+        # Reproducible: the simulation uses a fixed seed.
+        self.assertEqual(est, ie.metrics(self.base)["review"]["population_estimates"])
+
+    def test_none_found_still_has_an_upper_bound(self):
+        rs = stratum(0, "screened_in", 100, 30, 30) + stratum(500, "screened_out_referred", 100, 30, 0)
+        est = ie.metrics(rs)["review"]["population_estimates"]
+        self.assertEqual(est["eligible_turned_away_share"]["estimate"], 0.0)
+        self.assertGreater(est["eligible_turned_away_share"]["ci95"][1], 0.0)
+
+    def test_unreviewed_outcome_is_not_estimable(self):
+        rs = stratum(0, "screened_in", 50, 10, 9) + stratum(500, "screened_out_no_referral", 50, 0, 0)
+        est = ie.metrics(rs)["review"]["population_estimates"]
+        self.assertIn("screened_out_no_referral", est["status"])
+        self.assertIsNone(est["eligible_turned_away_share"])
+
+    def test_non_random_reviews_left_out(self):
+        rs = list(self.base)
+        before = ie.metrics(rs)["review"]["population_estimates"]
+        # A supervisor also reviewed a call a caller complained about: not part of the random sample.
+        flagged = dict(rs[-1], review=dict(review(True), random_sample=False))
+        rs[-1] = flagged
+        after = ie.metrics(rs)["review"]["population_estimates"]
+        self.assertEqual(after["excluded_non_random_reviews"], 1)
+        self.assertEqual(after["eligible_turned_away_share"], before["eligible_turned_away_share"])
+
+    def test_breakdown_by_period(self):
+        out = ie.report(self.rs, by=("period",))
+        by = out["by"]["period"]
+        self.assertGreater(by["pilot"]["eligible_turned_away_share"]["estimate"],
+                           by["baseline"]["eligible_turned_away_share"]["estimate"])
+        self.assertLess(by["pilot"]["wrongful_screen_out_rate"]["rate"],
+                        by["baseline"]["wrongful_screen_out_rate"]["rate"])
+
+
 class TestBreakdownAndReport(unittest.TestCase):
     def test_small_groups_suppressed(self):
         rs = [rec(i) for i in range(12)] + [rec(100 + i, language="ht") for i in range(3)]
@@ -208,6 +335,7 @@ class TestBreakdownAndReport(unittest.TestCase):
         self.assertEqual(set(out["by"]["period"]), {"baseline", "pilot"})
         self.assertEqual(set(out["by"]["site"]), {"site_a", "site_b"})
         self.assertTrue(out["overall"]["survey"]["screened_out_under_surveyed"])
+        self.assertEqual(out["overall"]["review"]["population_estimates"]["status"], "ok")
         json.dumps(out)
 
     def test_cli(self):
@@ -225,6 +353,12 @@ class TestBreakdownAndReport(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 self.assertEqual(ie.main([path, "--by", "site", "--min-cell", "5"]), 0)
             self.assertEqual(json.loads(out.getvalue())["overall"]["records"], 50)
+        plan = io.StringIO()
+        with contextlib.redirect_stdout(plan):
+            self.assertEqual(ie.main(["--plan-zero", "0.05", "--plan-margin", "0.1", "0.05"]), 0)
+        p = json.loads(plan.getvalue())
+        self.assertEqual(p["zero_found"]["reviews_per_outcome"], 73)
+        self.assertEqual(p["margin"]["reviews_per_outcome"], ie.plan_margin(0.1, 0.05))
 
 
 class TestSchemaFile(unittest.TestCase):
@@ -236,7 +370,8 @@ class TestSchemaFile(unittest.TestCase):
     def test_fields_match_code(self):
         self.assertEqual(set(self.p), set(ie.REQUIRED) | set(ie.OPTIONAL))
         self.assertEqual(set(self.schema["required"]), set(ie.REQUIRED))
-        self.assertEqual(self.p["schema_version"]["const"], ie.SCHEMA_VERSION)
+        self.assertEqual(tuple(self.p["schema_version"]["enum"]), ie.SUPPORTED_VERSIONS)
+        self.assertIn(ie.SCHEMA_VERSION, ie.SUPPORTED_VERSIONS)
         self.assertFalse(self.schema["additionalProperties"])
         for obj, keys in (("disclosures", ie.DISCLOSURE_KEYS), ("review", ie.REVIEW_KEYS),
                           ("callback", ie.CALLBACK_KEYS), ("demographics", ie.DEMOGRAPHIC_KEYS),
@@ -267,6 +402,7 @@ class TestRepoText(unittest.TestCase):
         self.assertIn("Apache-2.0", readme)
         self.assertIn("CC BY 4.0", readme)
         self.assertIn("not legal advice", readme)
+        self.assertIn(ie.SCHEMA_VERSION, readme)
 
 
 if __name__ == "__main__":
