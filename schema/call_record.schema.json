@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/munimtechnologies/legal-aid-intake-eval/blob/main/schema/call_record.schema.json",
+  "title": "Legal aid intake contact record (de-identified), version 0.1.0",
+  "description": "One record per intake contact (an AI voice call, a staff phone call, an online or walk-in intake), for evaluating AI intake against a baseline across sites. Holds no direct identifiers: no names, phone numbers, addresses, birth dates, emails, transcripts or free-text notes. Licence: CC BY 4.0. By MV2 of Munim, Inc. Not legal advice.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_id", "site", "period", "channel", "date", "language", "consent", "outcome"],
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "record_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{4,64}$", "description": "Pseudonymous id assigned by the site (for example a keyed hash of the CMS id). Never the CMS id itself or a phone number."},
+    "site": {"type": "string", "pattern": "^[A-Za-z0-9_-]{2,32}$", "description": "Short code for the organisation, so two or more sites can share one file."},
+    "period": {"enum": ["baseline", "pilot"], "description": "baseline = traditional intake before or alongside the pilot; pilot = while the AI intake is live."},
+    "channel": {"enum": ["ai_voice", "human_phone", "online", "walk_in", "other"]},
+    "date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "description": "Contact date only, no time of day."},
+    "after_hours": {"type": "boolean", "description": "Contact came outside the site's staffed intake hours."},
+    "language": {"type": "string", "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$", "description": "BCP 47 tag of the language the intake was conducted in."},
+    "consent": {"enum": ["given", "declined", "not_reached"], "description": "not_reached = the contact ended before consent was asked."},
+    "outcome": {"enum": ["screened_in", "screened_out_referred", "screened_out_no_referral", "transferred_to_human", "conflict_hold", "abandoned", "other"]},
+    "abandoned_at_step": {"enum": ["greeting", "consent", "eligibility", "facts", "wrap_up"]},
+    "duration_seconds": {"type": "integer", "minimum": 0},
+    "required_fields_total": {"type": "integer", "minimum": 0, "description": "Intake fields the site requires for this kind of matter."},
+    "required_fields_filled": {"type": "integer", "minimum": 0, "description": "Of those, how many reached the case management system populated."},
+    "disclosures": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "For AI contacts: whether each disclosure was delivered, as confirmed from logs or a sampled transcript.",
+      "properties": {
+        "ai_identified": {"type": "boolean"},
+        "not_a_lawyer": {"type": "boolean"},
+        "consent_captured": {"type": "boolean"},
+        "follow_up_timeline": {"type": "boolean"}
+      }
+    },
+    "human_requested": {"type": "boolean"},
+    "human_transfer_completed": {"type": ["boolean", "null"]},
+    "safety_flag_ai": {"type": "boolean", "description": "The AI raised a safety or urgency flag (for example domestic violence, a court date within days)."},
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Filled only for contacts in the human review sample.",
+      "properties": {
+        "reviewer_eligibility": {"enum": ["eligible", "ineligible", "unclear"]},
+        "should_screen_in": {"type": ["boolean", "null"], "description": "The reviewer's call on whether the contact should have been screened in under the site's own priorities."},
+        "safety_indicator_present": {"type": ["boolean", "null"]},
+        "legal_advice_given": {"type": ["boolean", "null"], "description": "The AI gave specific legal advice (a reviewer finding)."},
+        "data_errors": {"type": "integer", "minimum": 0, "description": "Fields the reviewer found wrong in the CMS record."}
+      }
+    },
+    "callback": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "needed": {"type": "boolean"},
+        "completed": {"type": ["boolean", "null"]},
+        "hours_to_callback": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "case_opened": {"type": ["boolean", "null"]},
+    "demographics": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Banded only. Report breakdowns with small-cell suppression.",
+      "properties": {
+        "age_band": {"enum": ["under_18", "18_24", "25_44", "45_64", "65_plus", "unknown"]},
+        "disability_reported": {"type": ["boolean", "null"]},
+        "rural": {"type": ["boolean", "null"]},
+        "county_fips": {"type": "string", "pattern": "^\\d{5}$"}
+      }
+    },
+    "survey": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Record survey offers for every outcome, including screened-out callers.",
+      "properties": {
+        "offered": {"type": "boolean"},
+        "responded": {"type": "boolean"},
+        "satisfaction_1_5": {"type": ["integer", "null"], "minimum": 1, "maximum": 5}
+      }
+    }
+  }
+}
