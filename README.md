@@ -10,6 +10,24 @@ Legal aid programs are now piloting AI voice agents that answer the intake line,
 
 What none of them gives is a **de-identified, per-contact record that two programs can fill in the same way**, plus code that turns it into comparable numbers. This repository is a first draft of that.
 
+## New in 0.3.0: start from a LegalServer export
+
+Most US legal aid programs run intake on LegalServer, and the AI voice agents in pilot write into it. `legalserver.py` takes an ordinary LegalServer report exported to CSV, plus a short mapping file written once per site, and:
+
+1. **draws the review sample** at random within each screening outcome (screened in, screened out with a referral, screened out without one), as a sheet of Case IDs for the program's own reviewers. The draw is reproducible from a seed and does not depend on row order;
+2. **converts** the export into schema records. LegalServer's six fixed dispositions become screening outcomes, and rejection reasons and referral codes separate referred, conflict and created-in-error rejections. Languages become BCP 47 tags and ages become bands. Counties become FIPS codes and rurality only where the mapping lists them;
+3. **joins the reviewers' answers** back, so `intake_eval.py` can estimate how many eligible callers were turned away.
+
+The Case ID never reaches the records. `record_id` is an HMAC-SHA256 of site and Case ID under a key the program keeps, so an evaluator without the key cannot link a record to a case by hashing Case IDs. Only mapped columns are read.
+
+```
+python legalserver.py export.csv --mapping mapping.json --draw-review 35 --seed 2027 > review_sheet.csv
+python legalserver.py export.csv --mapping mapping.json --key-file key.txt --reviews review_sheet.csv > records.jsonl
+python intake_eval.py records.jsonl --by period,channel,language,rural > report.json
+```
+
+[`docs/legalserver.md`](docs/legalserver.md) covers which report columns to add and how each disposition is read. It also lists what an export cannot give (AI disclosures, transfers and hang-ups before a record exists live in the voice agent's own logs). It was written from LegalServer's public help pages and has not yet been run on a real program's export, so expect to adjust the mapping on first use. The nearest open tools we found are API clients (CLSPhila's LegalServerReader in R, and a Python wrapper of LegalServer's older API). Neither de-identifies records or draws evaluation samples.
+
 ## New in 0.2.0: how many eligible callers were turned away
 
 An eligible caller who is wrongly screened out leaves no case behind, so the error is invisible unless someone looks. Version 0.1.0 reported the **wrongful screen-out rate**: of the screened-out calls a reviewer read, the share that should have been screened in. E-discovery calls this the *elusion* rate, and its known weakness carries over: **elusion alone cannot compare two intakes.** An intake that turns away more people can show lower elusion and still miss more eligible callers.
@@ -42,10 +60,12 @@ Prior work: elusion and stratified recall sampling are standard in e-discovery v
 
 | Path | What it is |
 |---|---|
-| `schema/call_record.schema.json` | JSON Schema (2020-12) for one intake contact: site, baseline or pilot period, channel, language, consent, outcome, where callers dropped off, disclosures delivered, human transfer on request, safety flag, a human-review block, callback, case opened, banded demographics and survey offer/response. No names, phone numbers, addresses, birth dates, transcripts or free text, by design. Version 0.1.0 records stay valid. |
+| `schema/call_record.schema.json` | JSON Schema (2020-12) for one intake contact: site, baseline or pilot period, channel, language, consent, outcome, where callers dropped off, disclosures delivered, human transfer on request, safety flag, a human-review block, callback, case opened, banded demographics and survey offer/response. No names, phone numbers, addresses, birth dates, transcripts or free text, by design. Schema version 0.2.0; 0.1.0 records stay valid. |
 | `intake_eval.py` | Validator, metrics and review-size planner, standard library only. |
+| `legalserver.py` | LegalServer CSV export to schema records, with keyed record ids, the stratified review-sample draw and the join of reviewers' answers. Standard library only. |
 | `docs/indicators.md` | Each indicator: definition, which data it comes from, and how it maps to LSC TIG evaluation plans (goals, objectives; administrative, survey and qualitative data). |
-| `test_intake_eval.py` | Tests, including that the schema file and the code agree, and the worked example above. |
+| `docs/legalserver.md`, `docs/legalserver-mapping.example.json` | How to build the LegalServer report and write the mapping. |
+| `test_intake_eval.py`, `test_legalserver.py` | Tests, including that the schema file and the code agree, the worked example above, and a made-up LegalServer export end to end. |
 
 ## Indicators computed
 
@@ -74,7 +94,7 @@ The validator rejects any field outside the schema and any value shaped like an 
 
 ## Limits
 
-- Version 0.2.0 is a draft, not yet used on a live program. Field names will change once it meets real LegalServer exports and real evaluation plans.
+- Version 0.3.0 is a draft, not yet used on a live program. The LegalServer adapter is built from public documentation, not a real export. Field names may change once the kit meets real exports and real evaluation plans.
 - It measures intake, not legal outcomes. Whether a screened-in case was helped needs case-closing data that differs by program.
 - The population estimates are only as good as the sample. Draw it at random within each outcome, include screened-out callers, and mark anything else `random_sample: false`. Reviews where the reviewer could not decide (`should_screen_in` null) are left out. If those calls differ from the rest, the estimate is biased, so report how many there were.
 - The intervals ignore the finite-population correction, which makes them slightly wide when a large part of a group is reviewed.

@@ -1,0 +1,34 @@
+{
+  "note": "Example only. Column headers are what your report shows; lookup values (intake types, rejection reasons, referral codes, languages) are your site's own, so replace them with yours. Counties and FIPS codes here are Middle Tennessee examples. CC BY 4.0, MV2 of Munim, Inc.",
+  "site": "site_a",
+  "period": {"pilot_start": "2027-01-15"},
+  "consent": "given",
+  "columns": {
+    "case_id": "Case ID",
+    "date": "Intake Date",
+    "disposition": "Disposition",
+    "reject_reason": "Rejection Reason",
+    "referral_code": "LSC Matter Referral Reporting Code",
+    "channel": "Intake Type",
+    "language": "Language",
+    "age": "Age at Intake",
+    "county": "County of Residence"
+  },
+  "channel_values": {
+    "AI Voice Agent": "ai_voice",
+    "Telephone": "human_phone",
+    "Online Intake": "online",
+    "Walk-In": "walk_in"
+  },
+  "channel_default": "other",
+  "language_values": {"Creole": "ht"},
+  "dispositions": {},
+  "referred_reasons": ["Referred to other provider"],
+  "referred_codes": [],
+  "conflict_reasons": ["Conflict of interest"],
+  "drop_reasons": ["Case created in error", "Duplicate"],
+  "counties": {
+    "Davidson": {"fips": "47037", "rural": false},
+    "Hickman": {"fips": "47081", "rural": true}
+  }
+}
